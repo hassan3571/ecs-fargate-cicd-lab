@@ -43,7 +43,7 @@ jobs:
       TF_IN_AUTOMATION: "true"
       TF_INPUT: "false"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -129,7 +129,7 @@ jobs:
     env:
       REPOSITORY: ${{ vars.PROJECT }}-${{ matrix.app }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
