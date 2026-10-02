@@ -14,7 +14,7 @@ Parameters:
 
   GitHubRepo:
     Type: String
-    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    AllowedPattern: "^[A-Za-z0-9_.-]+(@[0-9]+)?/[A-Za-z0-9_.-]+(@[0-9]+)?$"
     Description: GitHub repository as owner/name (case-sensitive).
 
   CreateOidcProvider:
