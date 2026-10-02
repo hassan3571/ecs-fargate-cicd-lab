@@ -56,7 +56,7 @@ jobs:
           # they can be copied into GitHub variables.
           mask-aws-account-id: false
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_wrapper: false
 
