@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ---- Stage 1: install production dependencies only ----
-FROM node:24-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 # ---- Stage 2: minimal runtime image ----
-FROM node:24-alpine AS runtime
+FROM node:26-alpine AS runtime
 
 # The runtime never installs packages, so remove npm, npx, yarn and corepack.
 # Smaller attack surface, and their bundled dependencies stop showing up
