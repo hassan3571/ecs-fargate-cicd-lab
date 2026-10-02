@@ -1,0 +1,105 @@
+# Reusable deployment of both services to one environment.
+# Called by deploy.yml for dev, then for prod.
+name: Deploy to environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: dev or prod (must match a GitHub environment)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: ${{ matrix.service }} -> ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    # The OIDC token's subject becomes repo:<owner>/<repo>:environment:<name>,
+    # which is the only subject the environment's IAM role trusts.
+    environment: ${{ inputs.environment }}
+    strategy:
+      matrix:
+        service: [backend, frontend]
+    env:
+      PROJECT: ${{ vars.PROJECT }}
+      SERVICE: ${{ matrix.service }}
+      CLUSTER: ${{ vars.PROJECT }}-${{ inputs.environment }}
+      FAMILY: ${{ vars.PROJECT }}-${{ inputs.environment }}-${{ matrix.service }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Resolve image URI
+        id: image
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "uri=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT}-${SERVICE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      # Start from the latest revision, so changes made in Terraform
+      # (new env vars, secrets, CPU/memory) are kept.
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition --task-definition "$FAMILY" \
+            --query taskDefinition > task-definition.json
+
+      - name: Render new task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ matrix.service }}
+          image: ${{ steps.image.outputs.uri }}
+          environment-variables: |
+            APP_VERSION=${{ github.sha }}
+
+      # Waits until the service is stable. If the new tasks fail their
+      # health checks, the ECS circuit breaker rolls back and this step fails.
+      - name: Deploy to ECS
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.CLUSTER }}
+          service: ${{ matrix.service }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      # After a circuit-breaker rollback the service is "stable" again, but on
+      # the OLD revision. Make sure the revision we registered is the one running.
+      - name: Verify the new revision is running
+        env:
+          EXPECTED: ${{ steps.deploy.outputs.task-definition-arn }}
+        run: |
+          running="$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].taskDefinition' --output text)"
+          echo "Expected: $EXPECTED"
+          echo "Running:  $running"
+          if [ "$running" != "$EXPECTED" ]; then
+            echo "::error::Deployment was rolled back by ECS. Check the service events and logs."
+            exit 1
+          fi
+
+      - name: Smoke test (the new version is live)
+        if: matrix.service == 'backend'
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          version=""
+          for attempt in $(seq 1 12); do
+            version="$(curl -fsS --max-time 5 "$APP_URL/api/info" | jq -r .version || true)"
+            if [ "$version" = "$GITHUB_SHA" ]; then
+              echo "Smoke test passed: $APP_URL is serving $version"
+              exit 0
+            fi
+            echo "Attempt $attempt: got '$version', waiting..."
+            sleep 5
+          done
+          echo "::error::Smoke test failed: expected version $GITHUB_SHA, got '$version'"
+          exit 1

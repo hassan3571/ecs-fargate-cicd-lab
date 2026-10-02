@@ -1,0 +1,156 @@
+# Runs Terraform from GitHub Actions: no local Terraform install needed.
+# Actions > Infrastructure > Run workflow > choose stack and action.
+#   plan    : shows what would change (nothing is modified)
+#   apply   : plans, then applies
+#   destroy : plans a destroy, then applies it
+name: Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: Which stack
+        required: true
+        type: choice
+        options: [shared, dev, prod]
+      action:
+        description: What to do
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+
+permissions:
+  contents: read
+  id-token: write
+
+# One Terraform run per stack at a time (the S3 lock also protects the state).
+concurrency:
+  group: terraform-${{ inputs.stack }}
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    name: ${{ inputs.action }} ${{ inputs.stack }}
+    runs-on: ubuntu-latest
+    # The Terraform role trusts only jobs running in the "infra" environment,
+    # which only allows the main branch (and optionally requires approval).
+    environment: infra
+    env:
+      STACK: ${{ inputs.stack }}
+      ACTION: ${{ inputs.action }}
+      PROJECT: ${{ vars.PROJECT }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          # Role ARNs in the outputs are not secret; keep them readable so
+          # they can be copied into GitHub variables.
+          mask-aws-account-id: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Select stack
+        run: |
+          if [ "$STACK" = "shared" ]; then
+            dir="infra/shared"; key="shared/terraform.tfstate"; varfile=""
+          else
+            dir="infra/env"; key="env/$STACK/terraform.tfstate"; varfile="-var-file=$STACK.tfvars"
+          fi
+          # project, region and repo are passed as TF_VAR_* so nobody has to
+          # edit them in the code.
+          {
+            echo "TF_DIR=$dir"
+            echo "TF_KEY=$key"
+            echo "TF_VAR_FILE=$varfile"
+            echo "TF_VAR_project=$PROJECT"
+            echo "TF_VAR_aws_region=$AWS_REGION"
+            echo "TF_VAR_github_repo=$GITHUB_REPOSITORY"
+          } >> "$GITHUB_ENV"
+
+      - name: Terraform init
+        run: |
+          terraform -chdir="$TF_DIR" init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform plan
+        run: |
+          DESTROY_FLAG=""
+          if [ "$ACTION" = "destroy" ]; then DESTROY_FLAG="-destroy"; fi
+          # shellcheck disable=SC2086
+          terraform -chdir="$TF_DIR" plan $DESTROY_FLAG $TF_VAR_FILE -out=tfplan
+          {
+            echo "## Terraform plan: $STACK ($ACTION)"
+            echo '```'
+            terraform -chdir="$TF_DIR" show -no-color tfplan | grep -E '^(Plan:|No changes|  # )' | head -200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply
+        if: inputs.action != 'plan'
+        run: terraform -chdir="$TF_DIR" apply tfplan
+
+      - name: Show outputs
+        if: inputs.action == 'apply'
+        run: |
+          {
+            echo "## Outputs: $STACK"
+            echo '```'
+            terraform -chdir="$TF_DIR" output
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          terraform -chdir="$TF_DIR" output
+
+  # After the shared stack is created, push a first image of each app with the
+  # tag "initial", so the ECS services in dev/prod have something to start.
+  initial-images:
+    name: Push initial images
+    needs: terraform
+    if: inputs.stack == 'shared' && inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    environment: infra
+    strategy:
+      matrix:
+        app: [backend, frontend]
+    env:
+      REPOSITORY: ${{ vars.PROJECT }}-${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push (skipped if it already exists)
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:initial
+        run: |
+          if aws ecr describe-images --repository-name "$REPOSITORY" \
+               --image-ids imageTag=initial >/dev/null 2>&1; then
+            echo "Image $REPOSITORY:initial already exists, nothing to do."
+            exit 0
+          fi
+          docker build -t "$IMAGE" "app/${{ matrix.app }}"
+          docker push "$IMAGE"

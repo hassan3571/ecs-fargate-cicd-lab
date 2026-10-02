@@ -1,0 +1,22 @@
+# Node
+node_modules/
+dist/
+npm-debug.log*
+
+# Environment files: never commit secrets
+.env
+.env.*
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+infra/backend.hcl
+infra/shared/terraform.tfvars
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

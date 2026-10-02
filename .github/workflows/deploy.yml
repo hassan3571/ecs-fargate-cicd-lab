@@ -1,0 +1,116 @@
+# Continuous delivery on every push to main:
+#   CI  ->  build, scan & push images (once)  ->  deploy dev  ->  approval  ->  deploy prod
+# The same image (tagged with the commit SHA) is promoted from dev to prod.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # needed to request the GitHub OIDC token for AWS
+
+# Never run two deployments at once; queue them instead of cancelling.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI
+    # Off until the AWS side exists: set the repository variable
+    # DEPLOY_ENABLED to "true" once dev and prod are created (see LAB_GUIDE.md).
+    # When this job is skipped, every job after it is skipped too.
+    if: vars.DEPLOY_ENABLED == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  build-push:
+    name: Build & push (${{ matrix.app }})
+    needs: ci
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [backend, frontend]
+    env:
+      REPOSITORY: ${{ vars.PROJECT }}-${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Short-lived credentials through OIDC. The role trusts only this
+      # repository's main branch. No AWS keys are stored in GitHub.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tags are immutable, so a re-run for the same commit reuses the image.
+      - name: Check whether this commit is already built
+        id: exists
+        run: |
+          if aws ecr describe-images --repository-name "$REPOSITORY" \
+               --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Image $REPOSITORY:$GITHUB_SHA already exists, skipping build."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.exists.outputs.found != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        if: steps.exists.outputs.found != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: app/${{ matrix.app }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+
+      - name: Set up Trivy
+        if: steps.exists.outputs.found != 'true'
+        uses: ./.github/actions/setup-trivy
+
+      - name: Scan image before pushing
+        if: steps.exists.outputs.found != 'true'
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:${{ github.sha }}
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress "$IMAGE"
+
+      - name: Push image
+        if: steps.exists.outputs.found != 'true'
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:${{ github.sha }}
+        run: docker push "$IMAGE"
+
+  deploy-dev:
+    name: Dev
+    needs: build-push
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: dev
+
+  # The "prod" GitHub environment has required reviewers, so this job
+  # waits for a manual approval before it can get AWS credentials.
+  deploy-prod:
+    name: Prod
+    needs: deploy-dev
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: prod

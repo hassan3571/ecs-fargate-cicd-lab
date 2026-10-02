@@ -1,0 +1,78 @@
+# Manual rollback of one service to an earlier task definition revision.
+# Actions > Rollback > Run workflow. For prod, the environment approval applies.
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment
+        required: true
+        type: choice
+        options: [dev, prod]
+      service:
+        description: Service
+        required: true
+        type: choice
+        options: [backend, frontend]
+      revision:
+        description: Task definition revision to roll back to (leave empty for the previous one)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+# Separate group from deploy.yml, so a rollback is never stuck behind a
+# deployment that is waiting for prod approval.
+concurrency:
+  group: rollback-${{ inputs.environment }}-${{ inputs.service }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Roll back ${{ inputs.service }} in ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      CLUSTER: ${{ vars.PROJECT }}-${{ inputs.environment }}
+      SERVICE: ${{ inputs.service }}
+      FAMILY: ${{ vars.PROJECT }}-${{ inputs.environment }}-${{ inputs.service }}
+      # Passed through env (not inlined in the script) to avoid script injection.
+      TARGET_REVISION: ${{ inputs.revision }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Roll back
+        run: |
+          current="$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].taskDefinition' --output text)"
+          current_rev="${current##*:}"
+
+          target="${TARGET_REVISION:-$((current_rev - 1))}"
+          if ! [[ "$target" =~ ^[0-9]+$ ]] || [ "$target" -lt 1 ]; then
+            echo "::error::Revision must be a positive number, got '$target'"
+            exit 1
+          fi
+
+          echo "Current: $FAMILY:$current_rev"
+          echo "Target:  $FAMILY:$target"
+          aws ecs describe-task-definition --task-definition "$FAMILY:$target" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text
+
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+            --task-definition "$FAMILY:$target" > /dev/null
+
+          echo "Waiting for the service to become stable..."
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+          {
+            echo "### Rollback complete"
+            echo "- Service: \`$SERVICE\` in \`$CLUSTER\`"
+            echo "- From revision $current_rev to revision $target"
+          } >> "$GITHUB_STEP_SUMMARY"
